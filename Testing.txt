@@ -1,0 +1,644 @@
+import boto3
+import json
+import psycopg2
+from awsglue.utils import getResolvedOptions
+import sys
+
+# Initialize AWS clients
+s3_client = boto3.client('s3')
+
+# Function to read JSON file from S3
+def read_json_from_s3(bucket, key):
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read().decode('utf-8')
+        return json.loads(content)
+    except s3_client.exceptions.NoSuchKey:
+        return None
+
+# Function to write JSON to S3
+def write_json_to_s3(bucket, key, data):
+    s3_client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data))
+
+# Function to connect to PostgreSQL
+def connect_to_postgres():
+    conn = psycopg2.connect(
+        dbname='your_dbname',
+        user='your_username',
+        password='your_password',
+        host='your_host',
+        port='your_port'
+    )
+    return conn
+
+# Function to get table schema from PostgreSQL
+def get_table_schema(conn, table_name):
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
+    schema = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    return schema
+
+# Function to check if record exists and update or insert accordingly
+def upsert_to_postgres(conn, table_name, record, schema):
+    cursor = conn.cursor()
+    id = record['id']
+    hire_date = record['hire_date']
+    department = record['department']
+    salary = record['salary']
+    report_id = record['reportId']
+    
+    # Typecasting hire_date to date format
+    hire_date = hire_date.split('-')
+    hire_date = f"{hire_date[0]}-{hire_date[1]}-{hire_date[2]}"
+    
+    # Validate incoming fields against table schema
+    for key in record.keys():
+        if key not in schema:
+            raise ValueError(f"Field '{key}' not found in table schema")
+    
+    # Check if the record exists
+    cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE id = %s", (id,))
+    exists = cursor.fetchone()[0]
+    
+    if exists:
+        # Update the existing record
+        update_query = f"""
+        UPDATE {table_name}
+        SET hire_date = %s, department = %s, salary = %s, report_id = %s
+        WHERE id = %s
+        """
+        cursor.execute(update_query, (hire_date, department, salary, report_id, id))
+    else:
+        # Insert a new record
+        insert_query = f"""
+        INSERT INTO {table_name} (id, hire_date, department, salary, report_id)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (id, hire_date, department, salary, report_id))
+    
+    conn.commit()
+    cursor.close()
+
+# Function to move files in S3
+def move_s3_object(source_bucket, source_key, dest_bucket, dest_key):
+    s3_client.copy_object(Bucket=dest_bucket, CopySource={'Bucket': source_bucket, 'Key': source_key}, Key=dest_key)
+    s3_client.delete_object(Bucket=source_bucket, Key=source_key)
+
+# Main function to process files
+def process_files(bucket, manifest_key):
+    manifest = read_json_from_s3(bucket, manifest_key)
+    
+    if manifest is None:
+        raise ValueError("Manifest file not found in S3")
+    
+    pending_files = [file['name'] for file in manifest['files'] if file['status'] == 'PENDING']
+    
+    error_log = {
+        'batch_id': manifest['batch_id'],
+        'date': manifest['date'],
+        'source': 'scheduled_etl',
+        'files_in_error': []
+    }
+    
+    updated_manifest = {
+        'batch_id': manifest['batch_id'],
+        'date': manifest['date'],
+        'source': 'scheduled_etl',
+        'files_processed': []
+    }
+    
+    conn = connect_to_postgres()
+    
+    for file_name in pending_files:
+        try:
+            file_content = read_json_from_s3(bucket, file_name)
+            if file_content is None:
+                error_log['files_in_error'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'FAILED',
+                    'error': {
+                        'error_code': 'FILE_NOT_FOUND',
+                        'error_message': f"File '{file_name}' not found in S3"
+                    }
+                })
+                updated_manifest['files_processed'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'FAILED'
+                })
+                continue
+            
+            table_name = file_name.split('.')[0].replace('_', '.')
+            schema = get_table_schema(conn, table_name)
+            
+            for record in file_content:
+                try:
+                    upsert_to_postgres(conn, table_name, record, schema)
+                except Exception as e:
+                    error_log['files_in_error'].append({
+                        'name': file_name,
+                        'schema_version': 'v1',
+                        'status': 'FAILED',
+                        'error': {
+                            'error_code': 'VALIDATION_ERROR',
+                            'error_message': str(e)
+                        }
+                    })
+                    updated_manifest['files_processed'].append({
+                        'name': file_name,
+                        'schema_version': 'v1',
+                        'status': 'FAILED'
+                    })
+                    break
+            else:
+                updated_manifest['files_processed'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'PROCESSED'
+                })
+        except Exception as e:
+            error_log['files_in_error'].append({
+                'name': file_name,
+                'schema_version': 'v1',
+                'status': 'FAILED',
+                'error': {
+                    'error_code': 'PROCESSING_ERROR',
+                    'error_message': str(e)
+                }
+            })
+            updated_manifest['files_processed'].append({
+                'name': file_name,
+                'schema_version': 'v1',
+                'status': 'FAILED'
+            })
+    
+    conn.close()
+    
+    # Write error log and updated manifest to S3
+    write_json_to_s3(bucket, f'company_name/error/schedule/{manifest["batch_id"]}/error_log.json', error_log)
+    write_json_to_s3(bucket, f'company_name/processed/schedule/{manifest["batch_id"]}/updated_manifest.json', updated_manifest)
+    write_json_to_s3(bucket, f'company_name/error/schedule/{manifest["batch_id"]}/updated_manifest.json', updated_manifest)
+    
+    # Move files based on their status
+    for file in updated_manifest['files_processed']:
+        source_key = f'company_name/source/schedule/{manifest["date"]}/{manifest["batch_id"]}/{file["name"]}'
+        if file['status'] == 'PROCESSED':
+            dest_key = f'company_name/processed/schedule/{manifest["batch_id"]}/{file["name"]}'
+        else:
+            dest_key = f'company_name/error/schedule/{manifest["batch_id"]}/{file["name"]}'
+        move_s3_object(bucket, source_key, bucket, dest_key)
+
+# Get bucket and manifest_key from Glue job parameters
+args = getResolvedOptions(sys.argv, ['bucket', 'manifest_key'])
+bucket = args['bucket']
+manifest_key = args['manifest_key']
+
+# Run the main function
+process_files(bucket, manifest_key)
+
+
+########################################################################################
+
+
+import boto3
+import json
+import psycopg2
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, lit
+
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("AWS Glue ETL Job") \
+    .getOrCreate()
+
+# Initialize AWS clients
+s3_client = boto3.client('s3')
+
+# Function to read JSON file from S3
+def read_json_from_s3(bucket, key):
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read().decode('utf-8')
+        return json.loads(content)
+    except s3_client.exceptions.NoSuchKey:
+        return None
+
+# Function to write JSON to S3
+def write_json_to_s3(bucket, key, data):
+    s3_client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data))
+
+# Function to connect to PostgreSQL
+def connect_to_postgres():
+    conn = psycopg2.connect(
+        dbname='your_dbname',
+        user='your_username',
+        password='your_password',
+        host='your_host',
+        port='your_port'
+    )
+    return conn
+
+# Function to get table schema from PostgreSQL
+def get_table_schema(conn, table_name):
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
+    schema = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    return schema
+
+# Function to check if record exists and update or insert accordingly
+def upsert_to_postgres(conn, table_name, record, schema):
+    cursor = conn.cursor()
+    id = record['id']
+    hire_date = record['hire_date']
+    department = record['department']
+    salary = record['salary']
+    report_id = record['reportId']
+    
+    # Typecasting hire_date to date format
+    hire_date = hire_date.split('-')
+    hire_date = f"{hire_date[0]}-{hire_date[1]}-{hire_date[2]}"
+    
+    # Validate incoming fields against table schema
+    for key in record.keys():
+        if key not in schema:
+            raise ValueError(f"Field '{key}' not found in table schema")
+    
+    # Check if the record exists
+    cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE id = %s", (id,))
+    exists = cursor.fetchone()[0]
+    
+    if exists:
+        # Update the existing record
+        update_query = f"""
+        UPDATE {table_name}
+        SET hire_date = %s, department = %s, salary = %s, report_id = %s
+        WHERE id = %s
+        """
+        cursor.execute(update_query, (hire_date, department, salary, report_id, id))
+    else:
+        # Insert a new record
+        insert_query = f"""
+        INSERT INTO {table_name} (id, hire_date, department, salary, report_id)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (id, hire_date, department, salary, report_id))
+    
+    conn.commit()
+    cursor.close()
+
+# Function to move files in S3
+def move_s3_object(source_bucket, source_key, dest_bucket, dest_key):
+    s3_client.copy_object(Bucket=dest_bucket, CopySource={'Bucket': source_bucket, 'Key': source_key}, Key=dest_key)
+    s3_client.delete_object(Bucket=source_bucket, Key=source_key)
+
+# Main function to process files
+def process_files(bucket, manifest_key):
+    manifest = read_json_from_s3(bucket, manifest_key)
+    
+    if manifest is None:
+        raise ValueError("Manifest file not found in S3")
+    
+    pending_files = [file['name'] for file in manifest['files'] if file['status'] == 'PENDING']
+    
+    error_log = {
+        'batch_id': manifest['batch_id'],
+        'date': manifest['date'],
+        'source': 'scheduled_etl',
+        'files_in_error': []
+    }
+    
+    updated_manifest = {
+        'batch_id': manifest['batch_id'],
+        'date': manifest['date'],
+        'source': 'scheduled_etl',
+        'files_processed': []
+    }
+    
+    conn = connect_to_postgres()
+    
+    for file_name in pending_files:
+        try:
+            file_content = read_json_from_s3(bucket, file_name)
+            if file_content is None:
+                error_log['files_in_error'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'FAILED',
+                    'error': {
+                        'error_code': 'FILE_NOT_FOUND',
+                        'error_message': f"File '{file_name}' not found in S3"
+                    }
+                })
+                updated_manifest['files_processed'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'FAILED'
+                })
+                continue
+            
+            table_name = file_name.split('.')[0].replace('_', '.')
+            schema = get_table_schema(conn, table_name)
+            
+            for record in file_content:
+                try:
+                    upsert_to_postgres(conn, table_name, record, schema)
+                except Exception as e:
+                    error_log['files_in_error'].append({
+                        'name': file_name,
+                        'schema_version': 'v1',
+                        'status': 'FAILED',
+                        'error': {
+                            'error_code': 'VALIDATION_ERROR',
+                            'error_message': str(e)
+                        }
+                    })
+                    updated_manifest['files_processed'].append({
+                        'name': file_name,
+                        'schema_version': 'v1',
+                        'status': 'FAILED'
+                    })
+                    break
+            else:
+                updated_manifest['files_processed'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'PROCESSED'
+                })
+        except Exception as e:
+            error_log['files_in_error'].append({
+                'name': file_name,
+                'schema_version': 'v1',
+                'status': 'FAILED',
+                'error': {
+                    'error_code': 'PROCESSING_ERROR',
+                    'error_message': str(e)
+                }
+            })
+            updated_manifest['files_processed'].append({
+                'name': file_name,
+                'schema_version': 'v1',
+                'status': 'FAILED'
+            })
+    
+    conn.close()
+    
+    # Write error log and updated manifest to S3
+    write_json_to_s3(bucket, f'company_name/error/schedule/{manifest["batch_id"]}/error_log.json', error_log)
+    write_json_to_s3(bucket, f'company_name/processed/schedule/{manifest["batch_id"]}/updated_manifest.json', updated_manifest)
+    write_json_to_s3(bucket, f'company_name/error/schedule/{manifest["batch_id"]}/updated_manifest.json', updated_manifest)
+    
+    # Move files based on their status
+    for file in updated_manifest['files_processed']:
+        source_key = f'company_name/source/schedule/{manifest["date"]}/{manifest["batch_id"]}/{file["name"]}'
+        if file['status'] == 'PROCESSED':
+            dest_key = f'company_name/processed/schedule/{manifest["batch_id"]}/{file["name"]}'
+        else:
+            dest_key = f'company_name/error/schedule/{manifest["batch_id"]}/{file["name"]}'
+        move_s3_object(bucket, source_key, bucket, dest_key)
+
+# Get bucket and manifest_key from Glue job parameters
+args = getResolvedOptions(sys.argv, ['bucket', 'manifest_key'])
+bucket = args['bucket']
+manifest_key = args['manifest_key']
+
+# Run the main function
+process_files(bucket, manifest_key)
+
+
+##########################################################################
+
+import boto3
+import json
+import psycopg2
+from pyspark.sql import SparkSession
+from awsglue.utils import getResolvedOptions
+import sys
+
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("AWS Glue ETL Job") \
+    .getOrCreate()
+
+# Initialize AWS clients
+args = getResolvedOptions(sys.argv, ['bucket', 'manifest_key', 'region'])
+bucket = args['bucket']
+manifest_key = args['manifest_key']
+region = args['region']
+
+s3_client = boto3.client('s3', region_name=region)
+
+# Function to read JSON file from S3
+def read_json_from_s3(bucket, key):
+    try:
+        response = s3_client.get_object(Bucket=bucket, Key=key)
+        content = response['Body'].read().decode('utf-8')
+        return json.loads(content)
+    except s3_client.exceptions.NoSuchKey:
+        return None
+
+# Function to write JSON to S3
+def write_json_to_s3(bucket, key, data):
+    s3_client.put_object(Bucket=bucket, Key=key, Body=json.dumps(data))
+
+# Function to connect to PostgreSQL
+def connect_to_postgres():
+    conn = psycopg2.connect(
+        dbname='your_dbname',
+        user='your_username',
+        password='your_password',
+        host='your_host',
+        port='your_port'
+    )
+    return conn
+
+# Function to get table schema from PostgreSQL
+def get_table_schema(conn, table_name):
+    cursor = conn.cursor()
+    cursor.execute(f"SELECT column_name FROM information_schema.columns WHERE table_name = '{table_name}'")
+    schema = [row[0] for row in cursor.fetchall()]
+    cursor.close()
+    return schema
+
+# Function to check if record exists and update or insert accordingly
+def upsert_to_postgres(conn, table_name, record, schema):
+    cursor = conn.cursor()
+    id = record['id']
+    hire_date = record['hire_date']
+    department = record['department']
+    salary = record['salary']
+    report_id = record['reportId']
+    
+    # Typecasting hire_date to date format
+    hire_date = hire_date.split('-')
+    hire_date = f"{hire_date[0]}-{hire_date[1]}-{hire_date[2]}"
+    
+    # Validate incoming fields against table schema
+    for key in record.keys():
+        if key not in schema:
+            raise ValueError(f"Field '{key}' not found in table schema")
+    
+    # Check if the record exists
+    cursor.execute(f"SELECT COUNT(*) FROM {table_name} WHERE id = %s", (id,))
+    exists = cursor.fetchone()[0]
+    
+    if exists:
+        # Update the existing record
+        update_query = f"""
+        UPDATE {table_name}
+        SET hire_date = %s, department = %s, salary = %s, report_id = %s
+        WHERE id = %s
+        """
+        cursor.execute(update_query, (hire_date, department, salary, report_id, id))
+    else:
+        # Insert a new record
+        insert_query = f"""
+        INSERT INTO {table_name} (id, hire_date, department, salary, report_id)
+        VALUES (%s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (id, hire_date, department, salary, report_id))
+    
+    conn.commit()
+    cursor.close()
+
+# Function to move files in S3
+def move_s3_object(source_bucket, source_key, dest_bucket, dest_key):
+    s3_client.copy_object(Bucket=dest_bucket, CopySource={'Bucket': source_bucket, 'Key': source_key}, Key=dest_key)
+    s3_client.delete_object(Bucket=source_bucket, Key=source_key)
+
+# Main function to process files
+def process_files(event):
+    bucket = event['bucket']
+    manifest_key = event['manifest_key']
+    manifest = read_json_from_s3(bucket, manifest_key)
+    
+    if manifest is None:
+        raise ValueError("Manifest file not found in S3")
+    
+    pending_files = [file['name'] for file in manifest['files'] if file['status'] == 'PENDING']
+    
+    error_log = {
+        'batch_id': manifest['batch_id'],
+        'date': manifest['date'],
+        'source': 'scheduled_etl',
+        'files_in_error': []
+    }
+    
+    updated_manifest = {
+        'batch_id': manifest['batch_id'],
+        'date': manifest['date'],
+        'source': 'scheduled_etl',
+        'files_processed': []
+    }
+    
+    conn = connect_to_postgres()
+    
+    for file_name in pending_files:
+        try:
+            file_content = read_json_from_s3(bucket, file_name)
+            if file_content is None:
+                error_log['files_in_error'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'FAILED',
+                    'error': {
+                        'error_code': 'FILE_NOT_FOUND',
+                        'error_message': f"File '{file_name}' not found in S3"
+                    }
+                })
+                updated_manifest['files_processed'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'FAILED'
+                })
+                continue
+            
+            table_name = file_name.split('.')[0].replace('_', '.')
+            schema = get_table_schema(conn, table_name)
+            
+            for record in file_content:
+                try:
+                    upsert_to_postgres(conn, table_name, record, schema)
+                except Exception as e:
+                    error_log['files_in_error'].append({
+                        'name': file_name,
+                        'schema_version': 'v1',
+                        'status': 'FAILED',
+                        'error': {
+                            'error_code': 'VALIDATION_ERROR',
+                            'error_message': str(e)
+                        }
+                    })
+                    updated_manifest['files_processed'].append({
+                        'name': file_name,
+                        'schema_version': 'v1',
+                        'status': 'FAILED'
+                    })
+                    break
+            else:
+                updated_manifest['files_processed'].append({
+                    'name': file_name,
+                    'schema_version': 'v1',
+                    'status': 'PROCESSED'
+                })
+        except Exception as e:
+            error_log['files_in_error'].append({
+                'name': file_name,
+                'schema_version': 'v1',
+                'status': 'FAILED',
+                'error': {
+                    'error_code': 'PROCESSING_ERROR',
+                    'error_message': str(e)
+                }
+            })
+            updated_manifest['files_processed'].append({
+                'name': file_name,
+                'schema_version': 'v1',
+                'status': 'FAILED'
+            })
+    
+    conn.close()
+    
+    # Write error log and updated manifest to S3
+    write_json_to_s3(bucket, f'company_name/error/schedule/{manifest["batch_id"]}/error_log.json', error_log)
+    write_json_to_s3(bucket, f'company_name/processed/schedule/{manifest["batch_id"]}/updated_manifest.json', updated_manifest)
+    write_json_to_s3(bucket, f'company_name/error/schedule/{manifest["batch_id"]}/updated_manifest.json', updated_manifest)
+    
+    # Move files based on their status
+    for file in updated_manifest['files_processed']:
+        source_key = f'company_name/source/schedule/{manifest["date"]}/{manifest["batch_id"]}/{file["name"]}'
+        if file['status'] == 'PROCESSED':
+            dest_key = f'company_name/processed/schedule/{manifest["batch_id"]}/{file["name"]}'
+        else:
+            dest_key = f'company_name/error/schedule/{manifest["batch_id"]}/{file["name"]}'
+        move_s3_object(bucket, source_key, bucket, dest_key)
+
+# Example event data for manual invocation
+event = {
+    'bucket': bucket,
+    'manifest_key': manifest_key
+}
+
+# Run the main function
+process_files(event)
+
+
+###########################################
+
+{
+  "Source": ["aws.s3"],
+  "DetailType": ["Object Created"],
+  "Detail": {
+    "bucket": {
+      "name": ["your_bucket_name"]
+    },
+    "object": {
+      "key": [{
+        "prefix": "company_name/source/schedule/"
+      }]
+    }
+  },
+  "Resources": ["arn:aws:s3:::your_bucket_name"]
+}
